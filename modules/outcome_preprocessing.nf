@@ -23,17 +23,35 @@ process OUTCOME_PREPROCESSING {
     
     cat("Loading outcome GWAS...\\n")
     outcome_df <- as.data.frame(fread("${outcome_file}"))
+    cn <- colnames(outcome_df)
+    cat("Outcome columns:", paste(cn, collapse=", "), "\\n")
+    
+    # ---- Robust column standardization (works across GWAS formats) ----
+    # standard error -> se
+    if (!"se" %in% cn) {
+        if ("standard_error" %in% cn) outcome_df\$se <- outcome_df\$standard_error
+        else if ("SE" %in% cn)        outcome_df\$se <- outcome_df\$SE
+    }
+    # p-value -> pval
+    if (!"pval" %in% cn) {
+        if ("p_value" %in% cn)   outcome_df\$pval <- outcome_df\$p_value
+        else if ("P" %in% cn)    outcome_df\$pval <- outcome_df\$P
+        else if ("pvalue" %in% cn) outcome_df\$pval <- outcome_df\$pvalue
+    }
+    # sample size -> sample_size  (auto-detect among common names)
+    if (!"sample_size" %in% colnames(outcome_df)) {
+        for (alt in c("TotalSampleSize","n","N","SampleSize","n_complete_samples","Neff")) {
+            if (alt %in% cn) { outcome_df\$sample_size <- outcome_df[[alt]]; break }
+        }
+    }
+    if (!"sample_size" %in% colnames(outcome_df)) {
+        cat("WARNING: no sample-size column found; setting NA\\n")
+        outcome_df\$sample_size <- NA_real_
+    }
     
     if ("${chr}" == "1") {
         saveRDS(outcome_df, "outcome_raw.rds")
     }
-    
-    outcome_df <- outcome_df %>%
-        mutate(
-            se = if ("standard_error" %in% colnames(.)) standard_error else se,
-            pval = if ("p_value" %in% colnames(.)) p_value else pval,
-            sample_size = if ("TotalSampleSize" %in% colnames(.)) TotalSampleSize else sample_size
-        )
     
     chr_pattern <- sprintf("chr%s", ${chr})
     outcome_chr <- outcome_df %>% 
