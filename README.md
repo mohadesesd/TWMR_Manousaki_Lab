@@ -405,12 +405,6 @@ Or modify `nextflow.config` with custom resource limits.
 nextflow run nextflow_mr_pipeline.nf --help
 ```
 
-## Citation
-
-If you use this pipeline in your research, please cite:
-
-> Your Citation Here (2024). Multi-Tissue Mendelian Randomization Pipeline. 
-> Available at https://github.com/yourusername/mr-pipeline
 
 ## License
 
