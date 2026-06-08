@@ -50,12 +50,7 @@ process FIND_MISSING_SNPS {
     saveRDS(missing_df, "missing_snps_list.rds")
     
     summary_text <- sprintf(
-        "Missing SNPs Summary\\n
-        ====================\\n
-        Total SNPs in exposure: %d\\n
-        Total SNPs in outcome: %d\\n
-        Missing SNPs (in exposure but not outcome): %d\\n
-        Missing SNPs percent: %.2f%%\\n",
+        "Missing SNPs Summary\\n====================\\nTotal SNPs in exposure: %d\\nTotal SNPs in outcome: %d\\nMissing SNPs (in exposure but not outcome): %d\\nMissing SNPs percent: %.2f%%\\n",
         nrow(exposure_combined),
         length(outcome_snps),
         nrow(missing_df),
@@ -227,10 +222,7 @@ process PROCESS_PROXY_RESULTS {
                 saveRDS(proxy_filtered, "processed_proxies.rds")
                 
                 stats_text <- sprintf(
-                    "Proxy Processing Complete\\n
-                    ========================\\n
-                    Total proxies loaded: %d\\n
-                    Proxies after filtering: %d\\n",
+                    "Proxy Processing Complete\\n========================\\nTotal proxies loaded: %d\\nProxies after filtering: %d\\n",
                     nrow(proxy_data),
                     nrow(proxy_filtered)
                 )
@@ -255,78 +247,156 @@ process MERGE_PROXIED_DATA {
     input:
     path processed_proxies
     path outcome_file
+    val ld_threshold
     
     output:
     path "outcome_with_proxies.rds", emit: outcome_with_proxies
+    path "proxies_merged_summary.txt", emit: merge_summary
     
     script:
     """
     #!/usr/bin/env Rscript
     
+    library(TwoSampleMR)
     library(data.table)
     library(dplyr)
+    library(tidyr)
+    library(reshape2)
     
-    cat("Merging proxies with outcome GWAS...\\n\\n")
+    cat("====== PROXY MERGE WITH ALLELE FLIPPING ======\\n\\n")
     
-    proxies <- readRDS("${processed_proxies}")
+    # Load data
     outcome_df <- read.delim(gzfile("${outcome_file}"), stringsAsFactors=FALSE)
+    proxies <- readRDS("${processed_proxies}")
     
-    # Auto-detect sample-size column so any GWAS works (n / TotalSampleSize / N / ...)
-    if (!"TotalSampleSize" %in% colnames(outcome_df)) {
-        for (alt in c("n","N","sample_size","SampleSize","n_complete_samples","Neff")) {
-            if (alt %in% colnames(outcome_df)) { outcome_df\$TotalSampleSize <- outcome_df[[alt]]; break }
+    cat("Loaded outcome GWAS:", nrow(outcome_df), "variants\\n")
+    cat("Loaded proxies:", nrow(proxies), "SNPs\\n\\n")
+    
+    # Prepare outcome data
+    outcome_df\$SNP <- paste(outcome_df\$chromosome, ":", outcome_df\$base_pair_location, sep="")
+    outcome_df\$effect_allele <- toupper(outcome_df\$effect_allele)
+    outcome_df\$other_allele <- toupper(outcome_df\$other_allele)
+    
+    # Filter for single nucleotide variants (remove indels)
+    outcome_df <- outcome_df[
+        outcome_df\$other_allele %in% c('A','T','C','G') & 
+        outcome_df\$effect_allele %in% c('A','T','C','G'), 
+    ]
+    
+    cat("After filtering indels:", nrow(outcome_df), "variants\\n")
+    outcome_snps <- unique(outcome_df\$SNP)
+    cat("Unique outcome SNPs:", length(outcome_snps), "\\n\\n")
+    
+    # Initialize output
+    outcomeList <- list()
+    proxy_matches <- 0
+    proxy_failures <- 0
+    allele_flips <- 0
+    
+    cat("Starting proxy search with allele handling...\\n")
+    cat(strrep("-", 60), "\\n")
+    
+    # Process each proxy
+    if (nrow(proxies) > 0) {
+        for (idx in seq_len(nrow(proxies))) {
+            proxy_row <- proxies[idx, ]
+            
+            # Check if proxy SNP exists in outcome
+            if (!proxy_row\$Coord %in% outcome_snps) {
+                proxy_failures <- proxy_failures + 1
+                next
+            }
+            
+            # Get outcome row for this proxy coordinate
+            outcome_row <- outcome_df[outcome_df\$SNP == proxy_row\$Coord, ]
+            
+            if (nrow(outcome_row) == 0) {
+                proxy_failures <- proxy_failures + 1
+                next
+            }
+            
+            # Extract the original SNP being proxied
+            original_snp <- proxy_row\$query_snp
+            
+            # Handle allele flipping if distance > 0
+            if (proxy_row\$Distance > 0) {
+                tryCatch({
+                    # Parse correlated alleles (format: "A=A,T=C")
+                    allele_pair <- strsplit(proxy_row\$Correlated_Alleles, ",")[[1]]
+                    
+                    if (length(allele_pair) == 2) {
+                        ref_alleles <- strsplit(allele_pair[1], "=")[[1]]
+                        alt_alleles <- strsplit(allele_pair[2], "=")[[1]]
+                        
+                        if (length(ref_alleles) == 2 && length(alt_alleles) == 2) {
+                            exp_ref <- ref_alleles[1]
+                            out_ref <- ref_alleles[2]
+                            exp_alt <- alt_alleles[1]
+                            out_alt <- alt_alleles[2]
+                            
+                            # Check allele match and flip if needed
+                            if (outcome_row\$effect_allele[1] == out_alt) {
+                                outcome_row\$effect_allele <- exp_alt
+                                outcome_row\$other_allele <- exp_ref
+                                allele_flips <- allele_flips + 1
+                            } else if (outcome_row\$effect_allele[1] == out_ref) {
+                                outcome_row\$effect_allele <- exp_ref
+                                outcome_row\$other_allele <- exp_alt
+                                allele_flips <- allele_flips + 1
+                            }
+                        }
+                    }
+                }, error = function(e) {
+                    cat("Warning: Allele parsing failed for", original_snp, "\\n")
+                })
+            }
+            
+            # Update SNP identifiers
+            outcome_row\$SNP <- proxy_row\$Coord
+            outcome_row\$SNP_Original <- original_snp
+            outcome_row\$RS_Number_Proxy <- proxy_row\$RS_Number
+            outcome_row\$LD_R2 <- as.numeric(proxy_row\$R2)
+            outcome_row\$LD_Distance <- proxy_row\$Distance
+            
+            outcomeList[[length(outcomeList) + 1]] <- outcome_row
+            proxy_matches <- proxy_matches + 1
+            
+            if (proxy_matches %% 50 == 0) {
+                cat("Progress: Matched", proxy_matches, "proxies\\n")
+            }
         }
     }
-    if (!"TotalSampleSize" %in% colnames(outcome_df)) outcome_df\$TotalSampleSize <- NA_real_
     
-    cat("Original outcome rows:", nrow(outcome_df), "\\n")
+    cat(strrep("-", 60), "\\n\\n")
     
-    if (nrow(proxies) == 0) {
-        cat("No proxies found - using outcome GWAS only\\n")
-        outcome_with_proxies <- outcome_df
+    # Bind all matched proxies
+    if (length(outcomeList) > 0) {
+        outcome_proxied <- data.table::rbindlist(outcomeList, fill=TRUE)
     } else {
-        cat("Proxies loaded:", nrow(proxies), "\\n\\n")
-        
-        outcome_formatted <- outcome_df %>%
-            mutate(
-                SNP = paste0(chromosome, ":", base_pair_location),
-                effect_allele = tolower(effect_allele),
-                other_allele = tolower(other_allele),
-                pval = p_value,
-                se = standard_error,
-                sample_size = TotalSampleSize
-            ) %>%
-            select(variant_id, SNP, chromosome, base_pair_location,
-                   effect_allele, other_allele, beta, se, pval, sample_size)
-        
-        proxies_formatted <- proxies %>%
-            mutate(
-                allele1 = substr(Alleles, 2, 2),
-                allele2 = substr(Alleles, 4, 4),
-                effect_allele = tolower(allele1),
-                other_allele = tolower(allele2),
-                SNP = Coord,
-                variant_id = RS_Number,
-                chromosome = sub(":.*", "", Coord),
-                base_pair_location = as.numeric(sub(".*:", "", Coord)),
-                beta = NA_real_,
-                se = NA_real_,
-                pval = NA_real_,
-                sample_size = NA_real_
-            ) %>%
-            select(variant_id, SNP, chromosome, base_pair_location,
-                   effect_allele, other_allele, beta, se, pval, sample_size)
-        
-        outcome_with_proxies <- rbind(outcome_formatted, proxies_formatted)
-        
-        cat("===== MERGE SUMMARY =====\\n")
-        cat("Outcome GWAS: ", nrow(outcome_formatted), " variants\\n")
-        cat("Added proxies: ", nrow(proxies_formatted), " variants\\n")
-        cat("Total: ", nrow(outcome_with_proxies), " variants\\n")
-        cat("========================\\n\\n")
+        outcome_proxied <- outcome_df[0, ]
     }
     
+    # Combine original outcome + proxied outcomes
+    outcome_with_proxies <- rbind(outcome_df, outcome_proxied, fill=TRUE)
+    outcome_with_proxies <- as.data.frame(outcome_with_proxies)
+    
+    # Save results
     saveRDS(outcome_with_proxies, "outcome_with_proxies.rds")
-    cat("✓ Merged data saved\\n")
+    
+    # Generate summary
+    summary_text <- sprintf(
+        "PROXY MERGE SUMMARY\\n===================\\nOriginal outcome variants: %d\\nProxies matched to outcome: %d\\nProxies failed to match: %d\\nAllele flips applied: %d\\nFinal merged variants: %d\\n\\nStatistics:\\n- Mean LD R²: %.4f\\n- Proxies with allele flipping: %.1f%%\\n",
+        nrow(outcome_df),
+        proxy_matches,
+        proxy_failures,
+        allele_flips,
+        nrow(outcome_with_proxies),
+        ifelse(nrow(outcome_proxied) > 0, mean(outcome_proxied\$LD_R2, na.rm=TRUE), 0),
+        ifelse(proxy_matches > 0, (allele_flips / proxy_matches * 100), 0)
+    )
+    
+    cat(summary_text)
+    writeLines(summary_text, "proxies_merged_summary.txt")
+    cat("\\n✓ Merged data saved to outcome_with_proxies.rds\\n")
     """
 }
