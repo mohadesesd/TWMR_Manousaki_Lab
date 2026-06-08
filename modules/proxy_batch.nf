@@ -271,6 +271,14 @@ process MERGE_PROXIED_DATA {
     proxies <- readRDS("${processed_proxies}")
     outcome_df <- read.delim(gzfile("${outcome_file}"), stringsAsFactors=FALSE)
     
+    # Auto-detect sample-size column so any GWAS works (n / TotalSampleSize / N / ...)
+    if (!"TotalSampleSize" %in% colnames(outcome_df)) {
+        for (alt in c("n","N","sample_size","SampleSize","n_complete_samples","Neff")) {
+            if (alt %in% colnames(outcome_df)) { outcome_df\$TotalSampleSize <- outcome_df[[alt]]; break }
+        }
+    }
+    if (!"TotalSampleSize" %in% colnames(outcome_df)) outcome_df\$TotalSampleSize <- NA_real_
+    
     cat("Original outcome rows:", nrow(outcome_df), "\\n")
     
     if (nrow(proxies) == 0) {
