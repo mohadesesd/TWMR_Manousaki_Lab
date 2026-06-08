@@ -62,8 +62,8 @@ mv nextflow /usr/local/bin/  # or add to your PATH
 ```
 
 2. **Clone or download the pipeline**:
-```bash
-git clone https://github.com/yourusername/mr-pipeline.git
+```bash[
+git clone https://github.com/mohadesesd/TWMR_Manousaki_Lab.git
 cd mr-pipeline
 ```
 
