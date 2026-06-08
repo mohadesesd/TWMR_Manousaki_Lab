@@ -420,15 +420,4 @@ MIT License - See LICENSE file for details
 
 For issues, questions, or contributions:
 - Open an issue on GitHub
-- Contact: your.email@institution.edu
-- Documentation: https://github.com/yourusername/mr-pipeline/wiki
-
-## References
-
-1. Davey Smith, G., & Hemani, G. (2014). Mendelian randomization: Genetic anchors for causal inference in epidemiological studies. Human Molecular Genetics, 23(R1), R89-R98.
-
-2. Morrison, J., Knoblauch, N., Marcus, J. H., Stephens, M., & He, X. (2020). Mendelian randomization accounting for correlated and individually-weak instruments. Nature Communications, 11(1), 6061.
-
-3. Giambartolomei, C., Vukcevic, D., Schadt, E. E., Franke, L., Hingorani, A. D., Wallace, C., & Plagnol, V. (2014). Bayesian test for colocalisation between pairs of genetic association studies using summary statistics. PLoS Genetics, 10(5), e1004383.
-
-4. GTEx Consortium. (2020). The GTEx Consortium atlas of eQTL variants across 30 human tissues. Molecular Systems Biology, 16(5), e9509.
+- Contact: mohadese.sayahiandehkordi@mail.mcgill.ca
