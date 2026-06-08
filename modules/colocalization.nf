@@ -44,6 +44,15 @@ process COLOCALIZATION {
     # Load raw data
     exposure <- readRDS("${exposure_raw}")
     outcome <- readRDS("${outcome_raw}")
+    # Robust outcome column standardization (handles n / TotalSampleSize / etc.)
+    if (!"se" %in% colnames(outcome) && "standard_error" %in% colnames(outcome)) outcome\$se <- outcome\$standard_error
+    if (!"pval" %in% colnames(outcome) && "p_value" %in% colnames(outcome)) outcome\$pval <- outcome\$p_value
+    if (!"sample_size" %in% colnames(outcome)) {
+        for (alt in c("TotalSampleSize","n","N","SampleSize","n_complete_samples")) {
+            if (alt %in% colnames(outcome)) { outcome\$sample_size <- outcome[[alt]]; break }
+        }
+    }
+    if (!"sample_size" %in% colnames(outcome)) outcome\$sample_size <- NA_real_
     
     # Load and combine harmonized data from all chromosomes
     har_files <- list.files(".", pattern = "harmonized_.*\\\\.rds\$")
@@ -141,9 +150,9 @@ process COLOCALIZATION {
                         effect_allele.outcome = toupper(effect_allele),
                         other_allele.outcome  = toupper(other_allele),
                         beta.outcome = beta,
-                        se.outcome   = standard_error,
-                        pval.outcome = p_value,
-                        samplesize.outcome = TotalSampleSize,
+                        se.outcome   = se,
+                        pval.outcome = pval,
+                        samplesize.outcome = sample_size,
                         id.outcome = "GWAS",
                         outcome = "GWAS"
                     )
