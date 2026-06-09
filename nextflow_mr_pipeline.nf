@@ -11,6 +11,8 @@ params.fstat_threshold = 10
 params.p_threshold = 0.05
 params.lddlink_token = "23a23730fd0b"
 params.ld_threshold = 0.8
+params.genome_build = "grch38"   // LDlink genome build: grch37 | grch38 | grch38_high_coverage
+params.population = "ALL"        // LDlink reference population (e.g. EUR, ALL)
 params.coloc_h4_threshold = 0.8
 params.window_size = 500000
 params.chromosomes = 1..22
@@ -44,7 +46,7 @@ workflow {
         )
         
         proxy_results = PROXY_BATCH_LDLINK(
-            missing_snps.missing_snps, params.lddlink_token, "grch38", "ALL"
+            missing_snps.missing_snps, params.lddlink_token, params.genome_build, params.population
         )
         
         proxies_processed = PROCESS_PROXY_RESULTS(
@@ -52,7 +54,9 @@ workflow {
         )
         
         proxied_outcome_data = MERGE_PROXIED_DATA(
-            proxies_processed.proxies_processed, params.outcome_file
+            proxies_processed.proxies_processed,
+            params.outcome_file,
+            params.ld_threshold
         )
         
         outcome_preprocessed = OUTCOME_PREPROCESSING(
