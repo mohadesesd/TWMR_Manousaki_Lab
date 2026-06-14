@@ -33,12 +33,24 @@ process FIND_MISSING_SNPS {
     
     cat(sprintf("Exposure data contains %d SNPs\\n", nrow(exposure_combined)))
     
-    missing_snps <- exposure_combined[!exposure_combined\$SNP %in% outcome_snps, ]
-    missing_snps_unique <- unique(missing_snps\$SNP)
+    missing_rows <- exposure_combined[!exposure_combined\$SNP %in% outcome_snps, ]
+    missing_rows <- missing_rows[!duplicated(missing_rows\$SNP), ]
     
-    cat(sprintf("Found %d unique SNPs in exposure missing from outcome\\n", length(missing_snps_unique)))
+    cat(sprintf("Found %d unique SNPs in exposure missing from outcome\\n", nrow(missing_rows)))
     
-    missing_df <- data.frame(SNP = missing_snps_unique, in_exposure = TRUE, in_outcome = FALSE)
+    # Detect exposure allele columns (effect allele = ALT in eGenes)
+    ea_col <- intersect(c("effect_allele.exposure","effect_allele","alt","ALT","Alt"), colnames(missing_rows))[1]
+    oa_col <- intersect(c("other_allele.exposure","other_allele","ref","REF","Ref"), colnames(missing_rows))[1]
+    cat("Exposure effect-allele column:", ifelse(is.na(ea_col),"<none>",ea_col),
+        "| other-allele column:", ifelse(is.na(oa_col),"<none>",oa_col), "\\n")
+    
+    missing_df <- data.frame(
+        SNP               = missing_rows\$SNP,
+        effect_allele_exp = if (!is.na(ea_col)) toupper(as.character(missing_rows[[ea_col]])) else NA_character_,
+        other_allele_exp  = if (!is.na(oa_col)) toupper(as.character(missing_rows[[oa_col]])) else NA_character_,
+        in_exposure = TRUE, in_outcome = FALSE,
+        stringsAsFactors = FALSE
+    )
     saveRDS(missing_df, "missing_snps_list.rds")
     
     summary_text <- sprintf(
@@ -53,142 +65,76 @@ process FIND_MISSING_SNPS {
 process PROXY_BATCH_LDLINK {
     container 'rocker/tidyverse:latest'
     publishDir "${params.outdir}/${params.tissue}/proxies", mode: 'copy'
-    
+
     maxRetries 0
     errorStrategy 'finish'
-    
+
     input:
     path missing_snps
     val lddlink_token
     val genome_build
     val pop
-    
+
     output:
     path "proxy_batch_log.txt", emit: log
-    path "combined_query_snp_list.txt", optional: true, emit: proxy_results
-    
+    path "combined_query_snp_list_${genome_build}.txt", optional: true, emit: proxy_results
+
     script:
     """
     #!/usr/bin/env Rscript
-    
+
     library(LDlinkR)
     library(data.table)
-    library(dplyr)
-    
+
     missing_df <- readRDS("${missing_snps}")
-    snps_to_query <- missing_df\$SNP
-    
+    snps_to_query <- unique(missing_df\$SNP)
+
     cat(strrep("=", 60), "\\n")
-    cat("LDLINK PROXY SEQUENTIAL QUERY (with retry & backoff)\\n")
+    cat("LDLINK PROXY BATCH QUERY (all SNPs in one call)\\n")
     cat(strrep("=", 60), "\\n\\n")
-    
-    cat("Configuration:\\n")
-    cat("  Token:", nchar("${lddlink_token}"), "characters\\n")
     cat("  Genome Build: ${genome_build}\\n")
     cat("  Population: ${pop}\\n")
-    cat("  SNPs to query:", length(snps_to_query), "\\n")
-    cat("  Max retries: 3\\n")
-    cat("  Exponential backoff: 2s, 4s, 8s\\n\\n")
-    
-    log_file <- file("proxy_batch_log.txt", open = "w")
-    
+    cat("  SNPs to query:", length(snps_to_query), "\\n\\n")
+
+    log_con <- file("proxy_batch_log.txt", open = "w")
+    writeLines(sprintf("LDproxy_batch on %d SNPs (build=${genome_build}, pop=${pop})",
+                       length(snps_to_query)), log_con)
+
     if (length(snps_to_query) == 0) {
         cat("No SNPs to query!\\n")
-        writeLines("No SNPs to query", log_file)
-        close(log_file)
+        writeLines("No SNPs to query", log_con)
+        close(log_con)
     } else {
-        cat("Starting sequential LDproxy queries with retry logic...\\n\\n")
-        writeLines("Starting sequential LDproxy queries with retry logic", log_file)
-        
-        all_proxies <- list()
-        success_count <- 0
-        error_count <- 0
-        retry_count_total <- 0
-        
-        for (i in seq_along(snps_to_query)) {
-            snp <- snps_to_query[i]
-            if (i %% 10 == 0) cat(sprintf("Progress: %d/%d SNPs queried\\n", i, length(snps_to_query)))
-            
-            result <- NULL
-            retry_attempt <- 0
-            max_retries <- 3
-            
-            while (is.null(result) && retry_attempt < max_retries) {
-                tryCatch({
-                    result <- LDproxy(
-                        snp = snp,
-                        pop = "${pop}",
-                        token = "${lddlink_token}",
-                        genome_build = "${genome_build}",
-                        r2d = "r2",
-                        timeout = 30
-                    )
-                    
-                    # Validate result
-                    if (!is.data.frame(result) || nrow(result) == 0 || grepl("error", result[1,1], ignore.case=TRUE)) {
-                        result <- NULL
-                        retry_attempt <- retry_attempt + 1
-                        if (retry_attempt < max_retries) {
-                            wait_time <- 2^retry_attempt
-                            cat("  Retry", retry_attempt, "for", snp, "- waiting", wait_time, "seconds...\\n")
-                            writeLines(paste("  Retry", retry_attempt, "for", snp), log_file)
-                            Sys.sleep(wait_time)
-                        }
-                    } else {
-                        result\$query_snp <- snp
-                        all_proxies[[i]] <- result
-                        success_count <- success_count + 1
-                    }
-                    
-                }, error = function(e) {
-                    retry_attempt <<- retry_attempt + 1
-                    result <<- NULL
-                    
-                    if (grepl("timeout|connection|killed", e\$message, ignore.case=TRUE)) {
-                        if (retry_attempt < max_retries) {
-                            wait_time <- 2^retry_attempt
-                            cat("  [Connection error] Retry", retry_attempt, "for", snp, "- waiting", wait_time, "seconds...\\n")
-                            writeLines(paste("  [Connection error] Retry", retry_attempt, "for", snp, ":", e\$message), log_file)
-                            Sys.sleep(wait_time)
-                        } else {
-                            writeLines(paste("  [Connection failed after retries] Skipping", snp, ":", e\$message), log_file)
-                        }
-                    } else {
-                        writeLines(paste("  Error for", snp, ":", e\$message), log_file)
-                        if (retry_attempt < max_retries) {
-                            wait_time <- 2^retry_attempt
-                            Sys.sleep(wait_time)
-                        }
-                    }
-                })
-            }
-            
-            # If all retries exhausted, count as error
-            if (is.null(result)) {
-                error_count <- error_count + 1
-                retry_count_total <- retry_count_total + retry_attempt
-            }
-            
-            # Standard sleep between queries (increased from 0.5 to 1.5 seconds)
-            Sys.sleep(1.5)
-        }
-        
-        cat(sprintf("\\nResults: %d successful, %d errors (with %d total retry attempts)\\n", 
-                   success_count, error_count, retry_count_total))
-        writeLines(sprintf("Results: %d successful, %d errors (with %d total retry attempts)", 
-                          success_count, error_count, retry_count_total), log_file)
-        
-        if (success_count > 0) {
-            combined_results <- do.call(rbind, all_proxies)
-            write.table(combined_results, "combined_query_snp_list.txt", sep="\\t", quote=FALSE, row.names=FALSE)
-            cat(sprintf("✓ Saved %d proxy records\\n", nrow(combined_results)))
-            writeLines(sprintf("✓ Saved %d proxy records", nrow(combined_results)), log_file)
+        # LDproxy_batch with append=TRUE writes a single combined file:
+        #   combined_query_snp_list.txt   (includes a query_snp column)
+        ok <- tryCatch({
+            LDproxy_batch(
+                snp          = snps_to_query,
+                pop          = "${pop}",
+                r2d          = "r2",
+                token        = "${lddlink_token}",
+                append       = TRUE,
+                genome_build = "${genome_build}"
+            )
+            TRUE
+        }, error = function(e) {
+            cat("LDproxy_batch error:", e\$message, "\\n")
+            writeLines(paste("LDproxy_batch error:", e\$message), log_con)
+            FALSE
+        })
+
+        out_file <- paste0("combined_query_snp_list_", "${genome_build}", ".txt")
+        if (file.exists(out_file)) {
+            n <- tryCatch(nrow(fread(out_file)), error = function(e) NA)
+            cat(sprintf("✓ %s written (%s rows)\\n", out_file, n))
+            writeLines(sprintf("Saved %s (%s rows)", out_file, n), log_con)
         } else {
-            cat("✗ No successful proxy queries\\n")
-            writeLines("✗ No successful proxy queries", log_file)
+            cat("✗ No", out_file, "produced\\n")
+            writeLines(paste("No", out_file, "produced"), log_con)
         }
+        close(log_con)
     }
-    close(log_file)
+
     cat(strrep("=", 60), "\\n")
     cat("Proxy query complete\\n")
     cat(strrep("=", 60), "\\n")
@@ -259,6 +205,7 @@ process MERGE_PROXIED_DATA {
     
     input:
     path processed_proxies
+    path missing_snps
     path outcome_file
     val ld_threshold
     
@@ -280,6 +227,11 @@ process MERGE_PROXIED_DATA {
     
     outcome_df <- read.delim(gzfile("${outcome_file}"), stringsAsFactors=FALSE)
     proxies <- readRDS("${processed_proxies}")
+    missing_info <- readRDS("${missing_snps}")
+
+    # Exposure effect/other allele lookup keyed by the missing SNP (query_snp)
+    exp_ea <- setNames(toupper(as.character(missing_info\$effect_allele_exp)), missing_info\$SNP)
+    exp_oa <- setNames(toupper(as.character(missing_info\$other_allele_exp)),  missing_info\$SNP)
     
     # Robust sample-size detection
     if (!"TotalSampleSize" %in% colnames(outcome_df)) {
@@ -316,34 +268,64 @@ process MERGE_PROXIED_DATA {
             if (nrow(outcome_row) == 0) { proxy_failures <- proxy_failures + 1; next }
             original_snp <- proxy_row\$query_snp
             
-            if (proxy_row\$Distance > 0) {
-                tryCatch({
-                    allele_pair <- strsplit(proxy_row\$Correlated_Alleles, ",")[[1]]
-                    if (length(allele_pair) == 2) {
-                        ref_alleles <- strsplit(allele_pair[1], "=")[[1]]
-                        alt_alleles <- strsplit(allele_pair[2], "=")[[1]]
-                        if (length(ref_alleles) == 2 && length(alt_alleles) == 2) {
-                            exp_ref <- ref_alleles[1]; out_ref <- ref_alleles[2]
-                            exp_alt <- alt_alleles[1]; out_alt <- alt_alleles[2]
-                            if (outcome_row\$effect_allele[1] == out_alt) {
-                                outcome_row\$effect_allele <- exp_alt; outcome_row\$other_allele <- exp_ref
-                                allele_flips <- allele_flips + 1
-                            } else if (outcome_row\$effect_allele[1] == out_ref) {
-                                outcome_row\$effect_allele <- exp_ref; outcome_row\$other_allele <- exp_alt
-                                allele_flips <- allele_flips + 1
+            # ---- Exposure-relative allele alignment + beta sign flip ----
+            # Label the proxied record with the EXPOSURE effect allele (eGenes ALT);
+            # flip beta when that allele pairs (in LD) with the proxy's OTHER allele.
+            ea_exp   <- exp_ea[[original_snp]]
+            ea_out   <- toupper(outcome_row\$effect_allele[1])   # proxy GWAS effect allele
+            oa_out   <- toupper(outcome_row\$other_allele[1])    # proxy GWAS other allele
+            beta_use <- as.numeric(outcome_row\$beta[1])
+            eff_final <- NA_character_; oth_final <- NA_character_
+            aligned <- FALSE
+
+            if (proxy_row\$Distance == 0) {
+                # same locus as the (missing) query SNP: keep GWAS alleles/beta
+                eff_final <- ea_out; oth_final <- oa_out
+                aligned   <- !is.na(beta_use)
+            } else if (!is.na(ea_exp)) {
+                ok <- tryCatch({
+                    cors <- strsplit(proxy_row\$Correlated_Alleles, ",")[[1]]
+                    res <- FALSE
+                    if (length(cors) == 2) {
+                        p1 <- strsplit(cors[1], "=")[[1]]   # c(exp_ref, out_ref)
+                        p2 <- strsplit(cors[2], "=")[[1]]   # c(exp_alt, out_alt)
+                        if (length(p1) == 2 && length(p2) == 2) {
+                            exp_ref <- toupper(p1[1]); out_ref <- toupper(p1[2])
+                            exp_alt <- toupper(p2[1]); out_alt <- toupper(p2[2])
+                            if (ea_exp %in% c(exp_ref, exp_alt)) {
+                                # exposure other allele + the proxy allele paired with ea_exp
+                                if (ea_exp == exp_ref) { oth_final <- exp_alt; corr_proxy <- out_ref }
+                                else                   { oth_final <- exp_ref; corr_proxy <- out_alt }
+                                eff_final <- ea_exp
+                                if (corr_proxy == ea_out) {
+                                    res <- TRUE                      # pairs with proxy EFFECT allele -> beta as-is
+                                } else if (corr_proxy == oa_out) {
+                                    beta_use <- -beta_use            # pairs with proxy OTHER allele -> FLIP beta
+                                    allele_flips <- allele_flips + 1
+                                    res <- TRUE
+                                }
+                                # else: GWAS alleles disagree w/ Correlated_Alleles (strand) -> res stays FALSE
                             }
                         }
                     }
-                }, error = function(e) cat("Warning: Allele parsing failed for", original_snp, "\\n"))
+                    res
+                }, error = function(e) { cat("Allele parse failed for", original_snp, "\\n"); FALSE })
+                aligned <- isTRUE(ok)
             }
-            
-            # NOTE: label the proxied record with the ORIGINAL missing SNP so it
-            # pairs with the exposure instrument during harmonization.
-            outcome_row\$SNP <- original_snp
-            outcome_row\$SNP_Original <- proxy_row\$Coord
+
+            if (!aligned || is.na(eff_final) || is.na(oth_final) || is.na(beta_use)) {
+                proxy_failures <- proxy_failures + 1
+                next
+            }
+
+            outcome_row\$effect_allele   <- eff_final
+            outcome_row\$other_allele    <- oth_final
+            outcome_row\$beta            <- beta_use
+            outcome_row\$SNP             <- original_snp
+            outcome_row\$SNP_Original    <- proxy_row\$Coord
             outcome_row\$RS_Number_Proxy <- proxy_row\$RS_Number
-            outcome_row\$LD_R2 <- as.numeric(proxy_row\$R2)
-            outcome_row\$LD_Distance <- proxy_row\$Distance
+            outcome_row\$LD_R2           <- as.numeric(proxy_row\$R2)
+            outcome_row\$LD_Distance     <- proxy_row\$Distance
             
             outcomeList[[length(outcomeList) + 1]] <- outcome_row
             proxy_matches <- proxy_matches + 1
