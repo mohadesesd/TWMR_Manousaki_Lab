@@ -55,6 +55,7 @@ workflow {
         
         proxied_outcome_data = MERGE_PROXIED_DATA(
             proxies_processed.proxies_processed,
+            missing_snps.missing_snps,
             params.outcome_file,
             params.ld_threshold
         )
